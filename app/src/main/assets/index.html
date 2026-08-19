@@ -1,0 +1,1854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>ATR Capture</title>
+
+<!-- PWA: standalone app behavior -->
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ATR Capture">
+<meta name="theme-color" content="#050505">
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #000000;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        color: #fff;
+        -webkit-font-smoothing: antialiased;
+    }
+
+    #app {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        height: 100dvh;
+        background: #050505;
+        /* Leave space for the mid-snap sheet (~55vh); sheet adjusts via JS */
+        padding-bottom: var(--sheet-mid-h, 55vh);
+    }
+    /* When sheet is at full snap, no bottom padding needed */
+    #app.sheet-full { padding-bottom: 0; }
+
+    /* ── Top bar ─────────────────────────────────────────────── */
+    .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: calc(env(safe-area-inset-top, 0px) + 14px) 16px 12px 16px;
+        flex-shrink: 0;
+        z-index: 5;
+    }
+    .topbar-title {
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 1.5px;
+        color: #666;
+        text-transform: uppercase;
+    }
+    .topbar-title span { color: #fff; }
+    .mode-pill {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 20px;
+        padding: 6px 12px;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        color: #888;
+        max-width: 60%;
+    }
+    .mode-pill .dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: #444;
+        flex-shrink: 0;
+    }
+    .mode-pill.ready .dot { background: #00ff66; box-shadow: 0 0 6px rgba(0,255,102,0.7); }
+    .mode-pill.busy .dot { background: #ffd23f; box-shadow: 0 0 6px rgba(255,210,63,0.7); animation: pulse 0.8s infinite alternate; }
+    @keyframes pulse { from { opacity: 0.4; } to { opacity: 1; } }
+
+    /* ── Canvas / screenshot viewer area ────────────────────────── */
+    .canvas-wrap {
+        flex: 1;
+        position: relative;
+        margin: 0 12px;
+        border-radius: 20px;
+        overflow: hidden;
+        background:
+            linear-gradient(135deg, rgba(255,255,255,0.02) 0%, transparent 60%),
+            #0a0a0a;
+        border: 1px solid rgba(255,255,255,0.06);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        touch-action: none;
+    }
+
+    .canvas-empty {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+        color: #3a3a3a;
+        padding: 20px;
+        text-align: center;
+    }
+    .canvas-empty svg { color: #333; }
+    .canvas-empty-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: #666;
+        letter-spacing: 0.3px;
+    }
+    .canvas-empty-sub {
+        font-size: 12px;
+        color: #3f3f3f;
+        max-width: 220px;
+        line-height: 1.5;
+    }
+
+    /* corner reticles just for visual flavor of a "scan" surface */
+    .reticle {
+        position: absolute;
+        width: 22px;
+        height: 22px;
+        opacity: 0.25;
+        pointer-events: none;
+        z-index: 4;
+    }
+    .reticle.tl { top: 14px; left: 14px; border-top: 2px solid #444; border-left: 2px solid #444; border-radius: 6px 0 0 0; }
+    .reticle.tr { top: 14px; right: 14px; border-top: 2px solid #444; border-right: 2px solid #444; border-radius: 0 6px 0 0; }
+    .reticle.bl { bottom: 14px; left: 14px; border-bottom: 2px solid #444; border-left: 2px solid #444; border-radius: 0 0 0 6px; }
+    .reticle.br { bottom: 14px; right: 14px; border-bottom: 2px solid #444; border-right: 2px solid #444; border-radius: 0 0 6px 0; }
+
+    /* image layer — transformed for pan/zoom */
+    #imgLayer {
+        position: absolute;
+        top: 0; left: 0;
+        transform-origin: 0 0;
+        will-change: transform;
+        display: none;
+    }
+    #imgLayer img {
+        display: block;
+        max-width: none;
+        max-height: none;
+        -webkit-user-drag: none;
+        user-select: none;
+        pointer-events: none;
+    }
+
+    /* persistent selection boxes (live in image coords inside imgLayer) */
+    .sel-box {
+        position: absolute;
+        border: 1.5px solid;
+        border-radius: 4px;
+        pointer-events: none;
+        z-index: 3;
+    }
+    .sel-box .sel-tag {
+        position: absolute;
+        top: -18px;
+        left: -1.5px;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        padding: 2px 6px;
+        border-radius: 4px 4px 4px 0;
+        white-space: nowrap;
+    }
+    .sel-box.price-box { border-color: #00ff66; background: rgba(0,255,102,0.08); box-shadow: 0 0 14px rgba(0,255,102,0.15); }
+    .sel-box.price-box .sel-tag { background: #00ff66; color: #000; }
+    .sel-box.atr-box { border-color: #ffd23f; background: rgba(255,210,63,0.08); box-shadow: 0 0 14px rgba(255,210,63,0.15); }
+    .sel-box.atr-box .sel-tag { background: #ffd23f; color: #000; }
+
+    /* live drag rectangle (screen coords, drawn in canvas-wrap) */
+    #dragRect {
+        position: absolute;
+        display: none;
+        border: 1.5px dashed #00ff66;
+        background: rgba(0,255,102,0.10);
+        border-radius: 4px;
+        z-index: 6;
+        pointer-events: none;
+    }
+    #dragRect.atr-drag { border-color: #ffd23f; background: rgba(255,210,63,0.10); }
+
+    /* Crosshair overlay lines & selection reticles */
+    .canvas-wrap.has-image { cursor: crosshair; }
+    .crosshair-h, .crosshair-v {
+        position: absolute;
+        pointer-events: none;
+        z-index: 25;
+        display: none;
+        opacity: 0.85;
+    }
+    .crosshair-h {
+        left: 0; right: 0; height: 1px;
+        background: #00ff66;
+        box-shadow: 0 0 6px rgba(0,255,102,0.5);
+    }
+    .crosshair-v {
+        top: 0; bottom: 0; width: 1px;
+        background: #00ff66;
+        box-shadow: 0 0 6px rgba(0,255,102,0.5);
+    }
+    .sel-box::before, #dragRect::before {
+        content: '';
+        position: absolute;
+        top: 50%; left: 0; right: 0; height: 1px;
+        border-top: 1px dashed rgba(255,255,255,0.4);
+        pointer-events: none;
+    }
+    .sel-box::after, #dragRect::after {
+        content: '';
+        position: absolute;
+        left: 50%; top: 0; bottom: 0; width: 1px;
+        border-left: 1px dashed rgba(255,255,255,0.4);
+        pointer-events: none;
+    }
+    .touch-anchor {
+        position: absolute;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 1.5px solid rgba(255,255,255,0.7);
+        background: rgba(0,255,102,0.25);
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+        z-index: 24;
+        display: none;
+        box-shadow: 0 0 8px rgba(0,0,0,0.5);
+    }
+
+    /* ── Tool dock (upload / zoom / select price / select atr) ─── */
+    .tool-dock {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 14px 16px;
+        flex-shrink: 0;
+    }
+    .tool-btn {
+        flex: 1;
+        max-width: 90px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 10px 4px 9px 4px;
+        border-radius: 16px;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.06);
+        color: #555;
+        font-size: 9.5px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+        cursor: pointer;
+        transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+        user-select: none;
+    }
+    .tool-btn:active { transform: scale(0.94); }
+    .tool-btn svg { width: 19px; height: 19px; }
+    .tool-btn.tool-price { color: #4a8f6a; }
+    .tool-btn.tool-price.armed { background: rgba(0,255,102,0.08); border-color: rgba(0,255,102,0.35); color: #00ff66; box-shadow: 0 0 16px rgba(0,255,102,0.12); }
+    .tool-btn.tool-atr { color: #8a7f4a; }
+    .tool-btn.tool-atr.armed { background: rgba(255,200,0,0.08); border-color: rgba(255,200,0,0.35); color: #ffd23f; box-shadow: 0 0 16px rgba(255,200,0,0.12); }
+    .tool-btn.disabled { opacity: 0.35; pointer-events: none; }
+
+    /* ── Bottom sheet: draggable 3-snap panel ───────────────────── */
+    .sheet {
+        position: fixed;
+        left: 0; right: 0; bottom: 0;
+        background: #050505;
+        border-radius: 28px 28px 0 0;
+        border: 1px solid rgba(255,255,255,0.07);
+        border-bottom: none;
+        box-shadow:
+            inset 8px 0 24px -8px rgba(255,0,0,0.10),
+            inset -8px 0 24px -8px rgba(0,255,0,0.10),
+            0 -10px 40px rgba(0,0,0,0.7);
+        z-index: 100;
+        /* height and translateY set by JS */
+        will-change: transform;
+        overflow: hidden;
+        touch-action: none;
+        transition: transform 0.38s cubic-bezier(0.32,0.72,0,1);
+    }
+    .sheet.dragging { transition: none; }
+    .sheet-inner {
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        padding: 6px 22px calc(env(safe-area-inset-bottom,0px) + 18px) 22px;
+        height: 100%;
+    }
+    .sheet-handle-wrap {
+        display: flex;
+        justify-content: center;
+        padding: 12px 0 6px 0;
+        cursor: grab;
+        flex-shrink: 0;
+    }
+    .sheet-handle {
+        width: 40px;
+        height: 4px;
+        border-radius: 3px;
+        background: rgba(255,255,255,0.18);
+    }
+    /* When sheet is fully expanded, hide topbar + dock */
+    #app.sheet-full .topbar,
+    #app.sheet-full .tool-dock,
+    #app.sheet-full .status-strip { opacity: 0; pointer-events: none; transition: opacity 0.2s; }
+    #app .topbar, #app .tool-dock, #app .status-strip { transition: opacity 0.2s; }
+
+    /* Price */
+    .price-container {
+        margin-bottom: 4px;
+        position: relative;
+        width: 100%;
+        text-align: center;
+    }
+    .price-display {
+        display: flex;
+        align-items: baseline;
+        justify-content: center;
+        pointer-events: none;
+    }
+    .price-int {
+        font-size: 52px;
+        font-weight: 300;
+        letter-spacing: -1.5px;
+        color: #fff;
+    }
+    .price-dec {
+        font-size: 17px;
+        font-weight: 300;
+        color: #555;
+    }
+    .price-input-overlay {
+        position: absolute;
+        top: 0; left: 0;
+        width: 100%; height: 100%;
+        opacity: 0;
+        cursor: text;
+        font-size: 52px;
+        text-align: center;
+        border: none;
+        background: none;
+    }
+    .price-copy {
+        position: absolute;
+        bottom: -6px;
+        right: 6px;
+        z-index: 2;
+        width: 30px;
+        height: 30px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 50%;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.07);
+        color: #666;
+        cursor: pointer;
+        opacity: 0.6;
+    }
+    .price-copy:active { opacity: 1; background: rgba(255,255,255,0.1); }
+    .price-label {
+        font-size: 9.5px;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+        color: #3a3a3a;
+        text-align: center;
+        margin-top: 2px;
+    }
+
+    .vert-line {
+        width: 1px;
+        height: 22px;
+        background: linear-gradient(to bottom, rgba(255,255,255,0.15), transparent);
+        margin: 10px auto 16px auto;
+    }
+
+    /* Pills */
+    .pills-row {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 22px;
+        width: 100%;
+        justify-content: center;
+    }
+    .pill {
+        display: flex;
+        align-items: center;
+        background: rgba(255,255,255,0.02);
+        border: 1px solid rgba(255,255,255,0.05);
+        border-radius: 20px;
+        padding: 8px 14px;
+        font-size: 11px;
+        font-weight: 500;
+        color: #888;
+        letter-spacing: 0.5px;
+    }
+    .pill input {
+        background: transparent;
+        border: none;
+        color: #ccc;
+        font-size: 12px;
+        font-weight: 500;
+        outline: none;
+        width: 68px;
+        margin-left: 6px;
+        font-family: inherit;
+    }
+    .pill-mult input {
+        width: 26px;
+        text-align: center;
+        margin-left: 6px;
+        margin-right: 4px;
+    }
+    .mult-arrows {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 2px;
+    }
+    .mult-arrows svg { cursor: pointer; }
+
+    /* Action bar */
+    .action-bar {
+        position: relative;
+        width: 100%;
+        height: 50px;
+        border-radius: 25px;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.05);
+        display: flex;
+        overflow: hidden;
+        box-shadow: inset 0 0 20px rgba(0,0,0,0.5);
+        margin-bottom: 30px;
+    }
+    .action-btn {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 1px;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        user-select: none;
+    }
+    .action-btn:active { opacity: 0.7; }
+    .action-btn.sell {
+        color: #cc3333;
+        background: linear-gradient(90deg, rgba(255,0,0,0.1) 0%, rgba(255,0,0,0.03) 100%);
+    }
+    .action-btn.sell.active { color: #ff5555; text-shadow: 0 0 12px rgba(255,0,0,0.8); }
+    .action-btn.sell.dimmed { background: linear-gradient(90deg, rgba(255,0,0,0.06) 0%, rgba(255,0,0,0.02) 100%); color: #773333; text-shadow: none; }
+    .action-btn.buy {
+        color: #33cc66;
+        background: linear-gradient(270deg, rgba(0,255,0,0.1) 0%, rgba(0,255,0,0.03) 100%);
+    }
+    .action-btn.buy.active { color: #00ff66; text-shadow: 0 0 12px rgba(0,255,0,0.6); }
+    .action-btn.buy.dimmed { background: linear-gradient(270deg, rgba(0,255,0,0.06) 0%, rgba(0,255,0,0.02) 100%); color: #337744; text-shadow: none; }
+    .action-center {
+        position: absolute;
+        top: 50%; left: 50%;
+        transform: translate(-50%, -50%);
+        width: 36px; height: 36px;
+        border-radius: 50%;
+        background: #111;
+        border: 1px solid rgba(255,255,255,0.2);
+        display: flex; align-items: center; justify-content: center;
+        color: #fff;
+        z-index: 3;
+        box-shadow: 0 0 10px rgba(0,0,0,0.5);
+        cursor: pointer;
+    }
+    .action-center:active { transform: translate(-50%, -50%) scale(0.92); }
+    .action-glow {
+        position: absolute; inset: 0;
+        border-radius: 25px;
+        pointer-events: none;
+        z-index: 1;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+    }
+    .action-glow.buy-glow {
+        background: linear-gradient(270deg, rgba(0,255,0,0.45) 0%, rgba(0,255,0,0.20) 25%, transparent 42%, transparent 62%, rgba(255,0,0,0.06) 82%, rgba(255,0,0,0.12) 95%, rgba(255,0,0,0.15) 100%);
+        opacity: 1;
+    }
+    .action-glow.sell-glow {
+        background: linear-gradient(90deg, rgba(255,0,0,0.45) 0%, rgba(255,0,0,0.20) 25%, transparent 42%, transparent 62%, rgba(0,255,0,0.06) 82%, rgba(0,255,0,0.12) 95%, rgba(0,255,0,0.15) 100%);
+        opacity: 1;
+    }
+
+    /* Expected move + result row (with paste option) */
+    .expected-move-container {
+        text-align: center;
+        margin-bottom: 22px;
+    }
+    .expected-perc {
+        font-size: 30px;
+        font-weight: 400;
+        letter-spacing: 0.5px;
+        display: inline-block;
+        text-align: center;
+        width: 100%;
+        background: linear-gradient(90deg, #00ff66 0%, #00ff66 40%, #fff 85%, #fff 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+    .expected-perc.negative {
+        background: linear-gradient(90deg, #ff3333 0%, #ff3333 40%, #fff 85%, #fff 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+    .expected-perc.placeholder {
+        background: none;
+        -webkit-text-fill-color: #2a2a2a;
+        color: #2a2a2a;
+    }
+    .expected-target-row {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        margin-top: 8px;
+    }
+    .expected-target {
+        font-size: 13px;
+        color: #444;
+        letter-spacing: 0.5px;
+    }
+    .result-copy-btn {
+        width: 26px; height: 26px;
+        border-radius: 50%;
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.07);
+        color: #555;
+        display: flex; align-items: center; justify-content: center;
+        cursor: copy;
+    }
+    .result-copy-btn:active { background: rgba(255,255,255,0.1); color: #fff; }
+
+    /* paste-in row for result + input price, per request */
+    .paste-row {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 8px;
+    }
+    .paste-field {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        background: rgba(255,255,255,0.02);
+        border: 1px dashed rgba(255,255,255,0.1);
+        border-radius: 14px;
+        padding: 10px 12px;
+    }
+    .paste-field-label {
+        font-size: 9px;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        color: #444;
+        display: block;
+        margin-bottom: 2px;
+    }
+    .paste-field-value {
+        font-size: 13px;
+        color: #999;
+        font-family: 'SF Mono', 'Menlo', monospace;
+        word-break: break-all;
+    }
+    .paste-field button {
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        color: #777;
+        border-radius: 10px;
+        padding: 6px 9px;
+        font-size: 9px;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        cursor: pointer;
+        flex-shrink: 0;
+    }
+    .paste-field button:active { background: rgba(255,255,255,0.12); color: #fff; }
+
+    /* Status strip under dock */
+    .status-strip {
+        text-align: center;
+        font-size: 10px;
+        color: #3a3a3a;
+        letter-spacing: 0.4px;
+        padding: 0 20px 10px 20px;
+        flex-shrink: 0;
+    }
+    .status-strip b { color: #666; }
+</style>
+</head>
+<body>
+
+<div id="app">
+
+    <!-- Top bar -->
+    <div class="topbar">
+        <div class="topbar-title">ATR <span>Scanner</span></div>
+        <div class="mode-pill" id="modePill"><span class="dot"></span><span id="modePillText">No image loaded</span></div>
+    </div>
+
+    <!-- Screenshot canvas area -->
+    <div class="canvas-wrap" id="canvasWrap">
+        <div class="reticle tl"></div>
+        <div class="reticle tr"></div>
+        <div class="reticle bl"></div>
+        <div class="reticle br"></div>
+        <div class="crosshair-h" id="crosshairH"></div>
+        <div class="crosshair-v" id="crosshairV"></div>
+        <div class="touch-anchor" id="touchAnchor"></div>
+
+        <div id="imgLayer">
+            <img id="chartImg" alt="" draggable="false">
+            <div class="sel-box price-box" id="priceBox" style="display:none;"><span class="sel-tag">PRICE</span></div>
+            <div class="sel-box atr-box" id="atrBox" style="display:none;"><span class="sel-tag">ATR</span></div>
+        </div>
+        <div id="dragRect"></div>
+
+        <div class="canvas-empty" id="canvasEmpty">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="3"></rect>
+                <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                <path d="M21 15l-5-5L5 21"></path>
+            </svg>
+            <div class="canvas-empty-title">Upload a chart screenshot</div>
+            <div class="canvas-empty-sub">Slide finger to position laser target (offset 45px above finger). Double-tap & drag to draw selection box. Pinch to zoom.</div>
+        </div>
+    </div>
+
+    <!-- Tool dock -->
+    <div class="tool-dock">
+        <div class="tool-btn" id="btnUpload">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+            Upload
+        </div>
+        <div class="tool-btn disabled" id="btnZoom">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
+            Zoom
+        </div>
+        <div class="tool-btn tool-price disabled" id="btnSelectPrice">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="8" rx="1"></rect><line x1="4" y1="12" x2="20" y2="12" stroke-dasharray="2 2"></line></svg>
+            Price
+        </div>
+        <div class="tool-btn tool-atr disabled" id="btnSelectAtr">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="8" rx="1"></rect><path d="M4 12h16" stroke-dasharray="2 2"></path><path d="M8 8v8M16 8v8"></path></svg>
+            ATR
+        </div>
+        <div class="tool-btn disabled" id="btnScan" style="color: #00ff66; border-color: rgba(0,255,102,0.15); background: rgba(0,255,102,0.02);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"></path>
+                <line x1="6" y1="12" x2="18" y2="12"></line>
+            </svg>
+            Scan
+        </div>
+    </div>
+
+    <div class="status-strip" id="statusStrip">Upload a screenshot to begin — everything is <b>fully functional</b></div>
+
+    <!-- Calculator sheet -->
+    <div class="sheet" id="sheet">
+        <div class="sheet-handle-wrap" id="sheetHandle">
+            <div class="sheet-handle"></div>
+        </div>
+        <div class="sheet-inner" id="sheetInner">
+
+        <!-- Crop Previews (Hidden by default) -->
+        <div class="crop-previews" id="cropPreviews" style="display: none; justify-content: center; gap: 16px; margin-bottom: 20px;">
+            <div class="crop-preview-box" id="priceCropBox" style="display: none; text-align: center;">
+                <div class="crop-label" style="font-size: 9px; color: #00ff66; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px; font-weight: 600;">Price Preview</div>
+                <div class="crop-canvas-wrap" style="border: 1px solid rgba(0,255,102,0.3); border-radius: 8px; padding: 6px; background: #111; display: inline-flex; align-items: center; justify-content: center; box-shadow: 0 0 10px rgba(0,255,102,0.15);">
+                    <canvas id="priceCropCanvas" style="height: 32px; max-width: 140px; display: block; object-fit: contain; image-rendering: pixelated;"></canvas>
+                </div>
+            </div>
+            <div class="crop-preview-box" id="atrCropBox" style="display: none; text-align: center;">
+                <div class="crop-label" style="font-size: 9px; color: #ffd23f; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 6px; font-weight: 600;">ATR Preview</div>
+                <div class="crop-canvas-wrap" style="border: 1px solid rgba(255,210,63,0.3); border-radius: 8px; padding: 6px; background: #111; display: inline-flex; align-items: center; justify-content: center; box-shadow: 0 0 10px rgba(255,210,63,0.15);">
+                    <canvas id="atrCropCanvas" style="height: 32px; max-width: 140px; display: block; object-fit: contain; image-rendering: pixelated;"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Price -->
+        <div class="price-container">
+            <div class="price-display" id="priceDisplay">
+                <span class="price-int" id="priceInt">0</span><span class="price-dec" id="priceDec">.00</span>
+            </div>
+            <div class="price-copy" id="priceCopyBtn" title="Copy price">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+            </div>
+            <input id="priceInput" type="text" inputmode="decimal" class="price-input-overlay" autocomplete="off" spellcheck="false" placeholder="0.00">
+        </div>
+        <div class="price-label">Input price</div>
+
+        <div class="vert-line"></div>
+
+        <!-- Pills -->
+        <div class="pills-row">
+            <div class="pill">
+                ATR <input id="atrInput" type="text" inputmode="decimal" value="" placeholder="0.00" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="pill pill-mult">
+                × <input id="multInput" type="text" inputmode="decimal" value="1.0" autocomplete="off" spellcheck="false">
+                <div class="mult-arrows">
+                    <svg width="8" height="6" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="3" id="multUp"><polyline points="18 15 12 9 6 15"></polyline></svg>
+                    <svg width="8" height="6" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="3" style="margin-top:2px;" id="multDown"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </div>
+            </div>
+        </div>
+
+        <!-- Buy / Sell -->
+        <div class="action-bar">
+            <div class="action-glow" id="actionGlow"></div>
+            <div class="action-btn sell" id="btnSell">SELL</div>
+            <div class="action-center" id="btnSwap">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+                </svg>
+            </div>
+            <div class="action-btn buy" id="btnBuy">BUY</div>
+        </div>
+
+        <!-- Expected move result -->
+        <div class="expected-move-container">
+            <div class="expected-perc placeholder" id="resultPerc">Select BUY or SELL</div>
+            <div class="expected-target-row">
+                <div class="expected-target" id="resultTarget">—</div>
+                <div class="result-copy-btn" id="resultCopyBtn" title="Copy target price">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                    </svg>
+                </div>
+            </div>
+        </div>
+
+        <!-- Paste-in fields -->
+        <div class="paste-row">
+            <div class="paste-field">
+                <div>
+                    <span class="paste-field-label">Input price</span>
+                    <span class="paste-field-value" id="pastePriceVal">—</span>
+                </div>
+                <button id="pastePriceBtn">PASTE</button>
+            </div>
+        </div>
+        <div class="paste-row">
+            <div class="paste-field">
+                <div>
+                    <span class="paste-field-label">Result (price + move)</span>
+                    <span class="paste-field-value" id="pasteResultVal">—</span>
+                </div>
+                <button id="pasteResultBtn">PASTE</button>
+            </div>
+        </div>
+
+        </div><!-- /sheet-inner -->
+    </div><!-- /sheet -->
+</div>
+
+
+<!-- hidden file picker -->
+<input type="file" id="fileInput" accept="image/*" style="display:none;">
+
+<!-- Toast -->
+<div id="toast" style="position:fixed;bottom:20px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:10px;font-size:12px;font-weight:500;background:#111;border:1px solid rgba(255,255,255,0.1);color:#fff;opacity:0;transition:opacity 0.25s ease;pointer-events:none;z-index:999;white-space:nowrap;"></div>
+
+<script>
+/* ══════════════════════════════════════════════════════════════
+   ATR Scanner — fully functional build
+   • Upload chart screenshot
+   • Pan / pinch-zoom / wheel-zoom
+   • Rectangle-select Price & ATR regions → OCR → auto-fill
+   • Original Buy/Sell calculation logic preserved
+   ══════════════════════════════════════════════════════════════ */
+
+function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.innerText = msg;
+    void t.offsetWidth;
+    t.style.opacity = '1';
+    clearTimeout(t._timer);
+    t._timer = setTimeout(() => { t.style.opacity = '0'; }, 2200);
+}
+
+/* ── DOM refs ─────────────────────────────────────────────── */
+const canvasWrap   = document.getElementById('canvasWrap');
+const canvasEmpty  = document.getElementById('canvasEmpty');
+const imgLayer     = document.getElementById('imgLayer');
+const chartImg     = document.getElementById('chartImg');
+const dragRect     = document.getElementById('dragRect');
+const crosshairH   = document.getElementById('crosshairH');
+const crosshairV   = document.getElementById('crosshairV');
+const touchAnchor  = document.getElementById('touchAnchor');
+const priceBox     = document.getElementById('priceBox');
+const atrBox       = document.getElementById('atrBox');
+const modePill     = document.getElementById('modePill');
+const modePillText = document.getElementById('modePillText');
+const statusStrip  = document.getElementById('statusStrip');
+const fileInput    = document.getElementById('fileInput');
+const btnUpload    = document.getElementById('btnUpload');
+const btnZoom      = document.getElementById('btnZoom');
+const btnSelectPrice = document.getElementById('btnSelectPrice');
+const btnSelectAtr   = document.getElementById('btnSelectAtr');
+const btnScan        = document.getElementById('btnScan');
+
+const cropPreviews    = document.getElementById('cropPreviews');
+const priceCropBox    = document.getElementById('priceCropBox');
+const priceCropCanvas = document.getElementById('priceCropCanvas');
+const atrCropBox      = document.getElementById('atrCropBox');
+const atrCropCanvas    = document.getElementById('atrCropCanvas');
+
+const priceInput = document.getElementById('priceInput');
+const priceInt   = document.getElementById('priceInt');
+const priceDec   = document.getElementById('priceDec');
+const atrInput   = document.getElementById('atrInput');
+const multInput  = document.getElementById('multInput');
+
+/* ── Status helpers ───────────────────────────────────────── */
+function setStatus(text, mode) { // mode: '' | 'ready' | 'busy'
+    modePillText.innerText = text;
+    modePill.className = 'mode-pill' + (mode ? ' ' + mode : '');
+}
+
+/* ── Image state + view transform ─────────────────────────── */
+let imageLoaded = false;
+let natW = 0, natH = 0;          // natural image size
+const view = { scale: 1, tx: 0, ty: 0 };
+
+function applyView() {
+    imgLayer.style.transform = `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})`;
+}
+
+function fitView() {
+    const cw = canvasWrap.clientWidth, ch = canvasWrap.clientHeight;
+    if (!natW || !natH) return;
+    const s = Math.min(cw / natW, ch / natH) * 0.96;
+    view.scale = s;
+    view.tx = (cw - natW * s) / 2;
+    view.ty = (ch - natH * s) / 2;
+    applyView();
+}
+
+function clampView() {
+    // keep at least part of the image on screen
+    const cw = canvasWrap.clientWidth, ch = canvasWrap.clientHeight;
+    const iw = natW * view.scale, ih = natH * view.scale;
+    const margin = 60;
+    if (iw <= cw) view.tx = Math.min(cw - margin, Math.max(margin - iw, view.tx));
+    else          view.tx = Math.min(cw - margin, Math.max(margin - iw, view.tx));
+    if (view.ty > ch - margin) view.ty = ch - margin;
+    if (view.ty < margin - ih) view.ty = margin - ih;
+}
+
+/* screen (wrap-relative) → image (natural) coords */
+function toImageCoords(x, y) {
+    return { x: (x - view.tx) / view.scale, y: (y - view.ty) / view.scale };
+}
+
+function zoomAt(cx, cy, factor) {
+    const ns = Math.min(20, Math.max(0.05, view.scale * factor));
+    const k = ns / view.scale;
+    view.tx = cx - (cx - view.tx) * k;
+    view.ty = cy - (cy - view.ty) * k;
+    view.scale = ns;
+    clampView();
+    applyView();
+}
+
+/* ── Upload ───────────────────────────────────────────────── */
+btnUpload.addEventListener('click', () => fileInput.click());
+
+fileInput.addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    const probe = new Image();
+    probe.onload = () => {
+        natW = probe.naturalWidth;
+        natH = probe.naturalHeight;
+        chartImg.src = url;
+        imgLayer.style.display = 'block';
+        canvasEmpty.style.display = 'none';
+        imageLoaded = true;
+        fitView();
+        clearSelections();
+        ['btnZoom','btnSelectPrice','btnSelectAtr'].forEach(id =>
+            document.getElementById(id).classList.remove('disabled'));
+        setStatus('Image ready', 'ready');
+        statusStrip.innerHTML = 'Pinch / drag to navigate — arm <b>Price</b> or <b>ATR</b> to scan a zone';
+        showToast('Screenshot loaded');
+        URL.revokeObjectURL(url);
+    };
+    probe.onerror = () => showToast('Could not load that image');
+    probe.src = url;
+    fileInput.value = '';
+});
+
+/* ── Tool arming (selection modes) ────────────────────────── */
+let armedTool = null; // null | 'price' | 'atr'
+let priceRect = null;
+let atrRect = null;
+
+function armTool(tool) {
+    if (!imageLoaded) return;
+    if (armedTool === tool) { disarmTools(); return; }
+    armedTool = tool;
+    btnSelectPrice.classList.toggle('armed', tool === 'price');
+    btnSelectAtr.classList.toggle('armed', tool === 'atr');
+    dragRect.className = tool === 'atr' ? 'atr-drag' : '';
+    setStatus(tool === 'price' ? 'Double-tap & drag box around PRICE' : 'Double-tap & drag box around ATR', 'ready');
+    showToast(tool.toUpperCase() + ' armed — double-tap & drag to draw box');
+}
+function disarmTools() {
+    armedTool = null;
+    btnSelectPrice.classList.remove('armed');
+    btnSelectAtr.classList.remove('armed');
+    if (imageLoaded) setStatus('Image ready', 'ready');
+}
+btnSelectPrice.addEventListener('click', () => armTool('price'));
+btnSelectAtr.addEventListener('click', () => armTool('atr'));
+
+/* Zoom button = reset / fit view */
+btnZoom.addEventListener('click', () => {
+    if (!imageLoaded) return;
+    fitView();
+    showToast('View reset — pinch or scroll to zoom');
+});
+
+/* ── Pointer handling: crosshair / double-touch rectangle select / pinch ─────── */
+const pointers = new Map();
+let pinchStart = null;
+let selStart = null;
+let isDrawingRect = false;
+
+const TOUCH_Y_OFFSET = -45; // Offset crosshairs 45px above finger on touch so finger never obstructs text
+
+// Double-tap-and-hold detection (touch only) to trigger rectangle drawing
+const DTAP_MAX_INTERVAL = 350;  // ms between taps to count as double-tap
+const DTAP_MAX_MOVE     = 30;   // px — taps must land close together
+let lastTapTime = 0;
+let lastTapPos  = null;
+
+// Touch crosshair behaves like a grabbed cursor: placing a finger elsewhere
+// does not teleport the crosshair. It moves only by the finger's movement.
+let touchDragStart = null;
+let crosshairStart = null;
+
+function wrapPos(e) {
+    const r = canvasWrap.getBoundingClientRect();
+    const isTouch = e.pointerType === 'touch';
+    const rawX = e.clientX - r.left;
+    const rawY = e.clientY - r.top;
+    return {
+        x: rawX,
+        y: Math.max(0, rawY + (isTouch ? TOUCH_Y_OFFSET : 0)),
+        rawX: rawX,
+        rawY: rawY,
+        isTouch: isTouch
+    };
+}
+
+function setCrosshairColor() {
+    if (armedTool === 'atr') {
+        crosshairH.style.background = '#ffd23f';
+        crosshairH.style.boxShadow = '0 0 6px rgba(255, 210, 63, 0.6)';
+        crosshairV.style.background = '#ffd23f';
+        crosshairV.style.boxShadow = '0 0 6px rgba(255, 210, 63, 0.6)';
+    } else {
+        crosshairH.style.background = '#00ff66';
+        crosshairH.style.boxShadow = '0 0 6px rgba(0, 255, 102, 0.6)';
+        crosshairV.style.background = '#00ff66';
+        crosshairV.style.boxShadow = '0 0 6px rgba(0, 255, 102, 0.6)';
+    }
+}
+
+function moveCrosshairTo(p) {
+    crosshairH.style.display = 'block';
+    crosshairV.style.display = 'block';
+    crosshairH.style.top = p.y + 'px';
+    crosshairV.style.left = p.x + 'px';
+    if (p.isTouch) {
+        touchAnchor.style.display = 'block';
+        touchAnchor.style.left = p.rawX + 'px';
+        touchAnchor.style.top = p.rawY + 'px';
+    } else {
+        touchAnchor.style.display = 'none';
+    }
+    setCrosshairColor();
+}
+
+canvasWrap.addEventListener('pointerdown', (e) => {
+    if (!imageLoaded) return;
+    canvasWrap.setPointerCapture(e.pointerId);
+    const p = wrapPos(e);
+    pointers.set(e.pointerId, p);
+
+    if (pointers.size === 2) {
+        // Pinch start
+        isDrawingRect = false;
+        selStart = null;
+        dragRect.style.display = 'none';
+        const pts = [...pointers.values()];
+        pinchStart = {
+            dist: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
+            scale: view.scale,
+            cx: (pts[0].x + pts[1].x) / 2,
+            cy: (pts[0].y + pts[1].y) / 2,
+            tx: view.tx, ty: view.ty
+        };
+        return;
+    }
+
+    if (pointers.size === 1) {
+        const now = performance.now();
+        const isTouch = p.isTouch;
+
+        // Check if this tap is a double-tap (touch) or mouse drag when armed
+        const isDoubleTap = isTouch && lastTapPos &&
+            (now - lastTapTime < DTAP_MAX_INTERVAL) &&
+            Math.hypot(p.rawX - lastTapPos.rawX, p.rawY - lastTapPos.rawY) < DTAP_MAX_MOVE;
+
+        // Draw rectangle if double-tap on touch OR single click with armed tool on mouse
+        const shouldStartDraw = isDoubleTap || (!isTouch && armedTool);
+
+        if (shouldStartDraw) {
+            if (!armedTool) armTool('price'); // default to price if double-tapped without explicit arming
+            isDrawingRect = true;
+
+            // IMPORTANT: when scanning with a double-touch, the scan box starts
+            // from the CURRENT CROSSHAIR position, not from the finger position.
+            // This means you can place the crosshair precisely on the number,
+            // lift your finger, then double-touch anywhere and drag to size the
+            // OCR box without the crosshair jumping away from the number.
+            if (isDoubleTap && isTouch) {
+                const ch = parseFloat(crosshairV.style.left);
+                const cv = parseFloat(crosshairH.style.top);
+                selStart = {
+                    x: Number.isFinite(ch) ? ch : p.x,
+                    y: Number.isFinite(cv) ? cv : p.y,
+                    rawX: p.rawX,
+                    rawY: p.rawY,
+                    isTouch: true
+                };
+            } else {
+                selStart = p;
+            }
+
+            dragRect.style.display = 'block';
+            if (armedTool === 'atr') {
+                dragRect.classList.add('atr-drag');
+            } else {
+                dragRect.classList.remove('atr-drag');
+            }
+            positionDragRect(selStart, selStart);
+            // For a touch double-tap, deliberately DO NOT move the crosshair.
+            // It remains exactly where the user positioned it.
+            if (!(isDoubleTap && isTouch)) {
+                moveCrosshairTo(p);
+            }
+            showToast('Drawing ' + (armedTool || 'PRICE').toUpperCase() + ' box from crosshair...');
+        } else {
+            // Single-finger touch: do NOT teleport the crosshair to the new
+            // finger position. Remember where the finger started and keep the
+            // crosshair where it was; pointermove will move it by the same delta.
+            isDrawingRect = false;
+            selStart = null;
+            touchDragStart = { x: p.rawX, y: p.rawY };
+            const ch = parseFloat(crosshairV.style.left);
+            const cv = parseFloat(crosshairH.style.top);
+            crosshairStart = {
+                x: Number.isFinite(ch) ? ch : p.x,
+                y: Number.isFinite(cv) ? cv : p.y
+            };
+            touchAnchor.style.display = 'block';
+            touchAnchor.style.left = p.rawX + 'px';
+            touchAnchor.style.top = p.rawY + 'px';
+        }
+
+        lastTapTime = now;
+        lastTapPos = p;
+    }
+});
+
+canvasWrap.addEventListener('pointermove', (e) => {
+    const p = wrapPos(e);
+    if (!pointers.has(e.pointerId)) {
+        // Desktop mouse hover
+        if (imageLoaded && !p.isTouch) {
+            canvasWrap.classList.add('has-image');
+            moveCrosshairTo(p);
+        }
+        return;
+    }
+    pointers.set(e.pointerId, p);
+
+    if (pointers.size === 1) {
+        if (isDrawingRect && selStart) {
+            // Drawing mode follows the finger normally.
+            moveCrosshairTo(p);
+        } else if (p.isTouch && touchDragStart && crosshairStart) {
+            // Normal touch mode: move the crosshair by the finger's DELTA,
+            // rather than snapping it to wherever the finger was placed.
+            moveCrosshairTo({
+                x: crosshairStart.x + (p.rawX - touchDragStart.x),
+                y: crosshairStart.y + (p.rawY - touchDragStart.y),
+                rawX: p.rawX,
+                rawY: p.rawY,
+                isTouch: true
+            });
+        } else {
+            moveCrosshairTo(p);
+        }
+
+        if (isDrawingRect && selStart) {
+            // Stretch selection box from selStart to current position
+            positionDragRect(selStart, p);
+        }
+    } else if (pointers.size === 2 && pinchStart) {
+        const pts = [...pointers.values()];
+        const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        const cx = (pts[0].x + pts[1].x) / 2;
+        const cy = (pts[0].y + pts[1].y) / 2;
+        const ns = Math.min(20, Math.max(0.05, pinchStart.scale * (dist / pinchStart.dist)));
+        const k = ns / pinchStart.scale;
+        view.scale = ns;
+        view.tx = cx - (pinchStart.cx - pinchStart.tx) * k + (cx - pinchStart.cx);
+        view.ty = cy - (pinchStart.cy - pinchStart.ty) * k + (cy - pinchStart.cy);
+        clampView();
+        applyView();
+    }
+});
+
+// Crosshair stays visible on touch release until next touch
+canvasWrap.addEventListener('pointerleave', (e) => {
+    if (e.pointerType !== 'touch') {
+        crosshairH.style.display = 'none';
+        crosshairV.style.display = 'none';
+        touchAnchor.style.display = 'none';
+    }
+});
+
+let panLast = null;
+
+function endPointer(e) {
+    if (!pointers.has(e.pointerId)) return;
+    const p = wrapPos(e);
+    pointers.delete(e.pointerId);
+    panLast = null;
+
+    if (isDrawingRect && selStart) {
+        dragRect.style.display = 'none';
+        const a = toImageCoords(selStart.x, selStart.y);
+        const b = toImageCoords(p.x, p.y);
+        const rect = normalizeRect(a, b);
+        selStart = null;
+        isDrawingRect = false;
+        const tool = armedTool || 'price';
+        disarmTools();
+        if (rect.w >= 6 && rect.h >= 6) {
+            placeSelBox(tool, rect);
+            if (tool === 'price') {
+                priceRect = rect;
+                updateCropPreview('price', rect);
+            } else {
+                atrRect = rect;
+                updateCropPreview('atr', rect);
+            }
+            btnScan.classList.remove('disabled');
+            setStatus('Box placed. Click SCAN to run OCR', 'ready');
+            showToast(tool.toUpperCase() + ' box placed. Click Scan.');
+        } else {
+            showToast('Box too small — double-tap & drag around number');
+        }
+        return;
+    }
+    if (pointers.size < 2) pinchStart = null;
+    if (pointers.size === 0) {
+        touchDragStart = null;
+        crosshairStart = null;
+    }
+}
+canvasWrap.addEventListener('pointerup', endPointer);
+canvasWrap.addEventListener('pointercancel', endPointer);
+
+function positionDragRect(a, b) {
+    const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    dragRect.style.left = x + 'px';
+    dragRect.style.top = y + 'px';
+    dragRect.style.width = Math.abs(a.x - b.x) + 'px';
+    dragRect.style.height = Math.abs(a.y - b.y) + 'px';
+    if (armedTool === 'atr') {
+        dragRect.classList.add('atr-drag');
+    } else {
+        dragRect.classList.remove('atr-drag');
+    }
+}
+
+function normalizeRect(a, b) {
+    const x = Math.max(0, Math.min(a.x, b.x));
+    const y = Math.max(0, Math.min(a.y, b.y));
+    const x2 = Math.min(natW, Math.max(a.x, b.x));
+    const y2 = Math.min(natH, Math.max(a.y, b.y));
+    return { x, y, w: x2 - x, h: y2 - y };
+}
+
+function placeSelBox(tool, rect) {
+    const el = tool === 'price' ? priceBox : atrBox;
+    el.style.display = 'block';
+    el.style.left = rect.x + 'px';
+    el.style.top = rect.y + 'px';
+    el.style.width = rect.w + 'px';
+    el.style.height = rect.h + 'px';
+}
+
+function clearSelections() {
+    priceBox.style.display = 'none';
+    atrBox.style.display = 'none';
+    priceRect = null;
+    atrRect = null;
+    priceCropBox.style.display = 'none';
+    atrCropBox.style.display = 'none';
+    cropPreviews.style.display = 'none';
+    btnScan.classList.add('disabled');
+}
+
+/* ── Mouse wheel zoom (desktop) ───────────────────────────── */
+canvasWrap.addEventListener('wheel', (e) => {
+    if (!imageLoaded || armedTool) return;
+    e.preventDefault();
+    const p = wrapPos(e);
+    zoomAt(p.x, p.y, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}, { passive: false });
+
+/* double-click to zoom in — desktop mouse only.
+   On touch, double-tap now arms pan mode instead (see pointerdown handler above). */
+canvasWrap.addEventListener('dblclick', (e) => {
+    if (!imageLoaded || armedTool) return;
+    if (e.pointerType === 'touch' || e.sourceCapabilities?.firesTouchEvents) return;
+    const p = wrapPos(e);
+    zoomAt(p.x, p.y, 1.8);
+});
+
+/* ── Crop Preview & Image Enhancement ────────────────────── */
+function updateCropPreview(tool, rect) {
+    const canvas = tool === 'price' ? priceCropCanvas : atrCropCanvas;
+    const box = tool === 'price' ? priceCropBox : atrCropBox;
+    
+    const pad = 2;
+    const sx = Math.max(0, rect.x - pad), sy = Math.max(0, rect.y - pad);
+    const sw = Math.min(natW - sx, rect.w + pad * 2);
+    const sh = Math.min(natH - sy, rect.h + pad * 2);
+
+    const UPSCALE = 3;
+    canvas.width = Math.max(1, Math.round(sw * UPSCALE));
+    canvas.height = Math.max(1, Math.round(sh * UPSCALE));
+    
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(chartImg, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+        const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        const boosted = gray > 120 ? 255 : (gray < 60 ? 0 : gray);
+        d[i] = d[i + 1] = d[i + 2] = boosted;
+    }
+    ctx.putImageData(imgData, 0, 0);
+    
+    cropPreviews.style.display = 'flex';
+    box.style.display = 'block';
+}
+
+/* ── Mobile-safe clipboard helpers ─────────────────────────── */
+async function mobileCopy(text) {
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(String(text));
+            return true;
+        }
+    } catch (_) {}
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = String(text);
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus(); ta.select();
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return ok;
+    } catch (_) { return false; }
+}
+
+async function mobilePaste() {
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            return await navigator.clipboard.readText();
+        }
+    } catch (_) {}
+    return null;
+}
+
+/* ── OCR engine — robust multi-pass TradingView scanner ────── */
+let ocrWorker = null;
+
+async function getOcrWorker() {
+    if (ocrWorker) return ocrWorker;
+    setStatus('Loading scanner…', 'busy');
+    ocrWorker = await Tesseract.createWorker('eng');
+    await ocrWorker.setParameters({
+        tessedit_char_whitelist: '0123456789.,-',
+        preserve_interword_spaces: '0',
+        user_defined_dpi: '300'
+    });
+    return ocrWorker;
+}
+
+function normalizeOcrText(text) {
+    return String(text || '')
+        .normalize('NFKC')
+        .replace(/\s+/g, '')
+        .replace(/[OoQq]/g, '0')
+        .replace(/[IiLl|]/g, '1')
+        .replace(/[^\d.,-]/g, '');
+}
+
+function parseOcrNumber(text) {
+    const s = normalizeOcrText(text);
+    if (!s) return null;
+
+    const matches = s.match(/-?\d[\d.,]*/g) || [];
+    const candidates = [];
+
+    for (const raw of matches) {
+        const digits = raw.replace(/[^\d]/g, '');
+        if (!digits) continue;
+
+        let valueText = raw;
+        const dots = (valueText.match(/\./g) || []).length;
+        const commas = (valueText.match(/,/g) || []).length;
+
+        if (dots && commas) {
+            if (valueText.lastIndexOf('.') > valueText.lastIndexOf(',')) {
+                valueText = valueText.replace(/,/g, '');
+            } else {
+                valueText = valueText.replace(/\./g, '').replace(',', '.');
+            }
+        } else if (commas) {
+            const parts = valueText.split(',');
+            if (parts.length === 2 && parts[1].length >= 1 &&
+                parts[1].length <= 6 && parts[0].length <= 3) {
+                valueText = parts[0] + '.' + parts[1];
+            } else {
+                valueText = valueText.replace(/,/g, '');
+            }
+        }
+
+        const number = Number(valueText);
+        if (Number.isFinite(number)) candidates.push({raw, number, digits: digits.length});
+    }
+
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.digits - a.digits);
+    return candidates[0];
+}
+
+function makeOcrCanvas(rect, mode) {
+    const pad = Math.max(2, Math.round(Math.min(rect.w, rect.h) * 0.15));
+    const sx = Math.max(0, rect.x - pad);
+    const sy = Math.max(0, rect.y - pad);
+    const sw = Math.min(natW - sx, rect.w + pad * 2);
+    const sh = Math.min(natH - sy, rect.h + pad * 2);
+
+    const UPSCALE = 5;
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(sw * UPSCALE));
+    canvas.height = Math.max(1, Math.round(sh * UPSCALE));
+
+    const ctx = canvas.getContext('2d', {willReadFrequently: true});
+    ctx.imageSmoothingEnabled = mode === 'original' || mode === 'contrast';
+    ctx.drawImage(chartImg, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+
+    if (mode === 'original') return canvas;
+
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = img.data;
+    let sum = 0, count = 0;
+
+    for (let i = 0; i < d.length; i += 4) {
+        const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+        sum += gray;
+        count++;
+    }
+
+    const mean = sum / Math.max(1, count);
+
+    for (let i = 0; i < d.length; i += 4) {
+        const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+        let v = gray;
+
+        if (mode === 'adaptive') v = gray > mean ? 255 : 0;
+        if (mode === 'high') v = gray > 150 ? 255 : 0;
+        if (mode === 'mid') v = gray > 125 ? 255 : 0;
+        if (mode === 'low') v = gray > 100 ? 255 : 0;
+        if (mode === 'contrast') v = Math.max(0, Math.min(255, (gray - 128)*2 + 128));
+
+        d[i] = d[i+1] = d[i+2] = v;
+        d[i+3] = 255;
+    }
+
+    ctx.putImageData(img, 0, 0);
+    return canvas;
+}
+
+async function runOcrPass(canvas, psm) {
+    const worker = await getOcrWorker();
+
+    await worker.setParameters({
+        tessedit_char_whitelist: '0123456789.,-',
+        tessedit_pageseg_mode: String(psm),
+        preserve_interword_spaces: '0',
+        user_defined_dpi: '300'
+    });
+
+    const result = await worker.recognize(canvas);
+
+    return {
+        rawText: result.data.text || '',
+        confidence: Number(result.data.confidence) || 0,
+        parsed: parseOcrNumber(result.data.text || '')
+    };
+}
+
+async function scanRegion(tool, rect) {
+    setStatus('Reading ' + tool.toUpperCase() + '…', 'busy');
+
+    try {
+        const results = [];
+        const modes = ['original', 'adaptive', 'high', 'mid', 'low', 'contrast'];
+        const psms = [7, 8, 13];
+
+        for (const mode of modes) {
+            const canvas = makeOcrCanvas(rect, mode);
+
+            for (const psm of psms) {
+                try {
+                    const result = await runOcrPass(canvas, psm);
+                    if (result.parsed) results.push({...result, mode, psm});
+                } catch (e) {
+                    console.warn('OCR pass failed:', mode, psm, e);
+                }
+            }
+        }
+
+        if (!results.length) {
+            setStatus('OCR failed', 'ready');
+            showToast("Couldn't read " + tool.toUpperCase() + " — try a tighter box");
+            return null;
+        }
+
+        const groups = new Map();
+
+        for (const result of results) {
+            const key = String(result.parsed.number);
+
+            if (!groups.has(key)) {
+                groups.set(key, {
+                    number: result.parsed.number,
+                    raw: result.parsed.raw,
+                    count: 0,
+                    confidenceSum: 0,
+                    bestConfidence: 0
+                });
+            }
+
+            const group = groups.get(key);
+            group.count++;
+            group.confidenceSum += result.confidence;
+            group.bestConfidence = Math.max(group.bestConfidence, result.confidence);
+
+            if (result.parsed.raw.includes(',') || result.parsed.raw.includes('.')) {
+                group.raw = result.parsed.raw;
+            }
+        }
+
+        const ranked = [...groups.values()].sort((a, b) => {
+            const scoreA = a.count * 100 + a.confidenceSum + a.bestConfidence * 0.5;
+            const scoreB = b.count * 100 + b.confidenceSum + b.bestConfidence * 0.5;
+            return scoreB - scoreA;
+        });
+
+        const winner = ranked[0];
+        const detected = winner.raw && /\d/.test(winner.raw)
+            ? winner.raw
+            : String(winner.number);
+
+        if (tool === 'price') {
+            priceInput.value = detected;
+            updatePriceDisplay();
+            document.getElementById('pastePriceVal').innerText = detected;
+            setStatus('Price scanned ✓', 'ready');
+            showToast('Price detected: ' + detected);
+        } else {
+            atrInput.value = detected;
+            setStatus('ATR scanned ✓', 'ready');
+            showToast('ATR detected: ' + detected);
+        }
+
+        console.log('[ATRF OCR]', {
+            detected,
+            numericValue: winner.number,
+            agreement: winner.count + '/' + results.length,
+            bestConfidence: winner.bestConfidence,
+            passes: results
+        });
+
+        return detected;
+    } catch (err) {
+        console.error('[ATRF OCR ERROR]', err);
+        setStatus('Scan failed', 'ready');
+        showToast('Scan error — try again');
+        return null;
+    }
+}
+
+function extractNumber(rawText) {
+    const parsed = parseOcrNumber(rawText);
+    return parsed ? parsed.raw : null;
+}
+
+// Scan button action listener
+btnScan.addEventListener('click', async () => {
+    if (btnScan.classList.contains('disabled')) return;
+    btnScan.classList.add('disabled');
+    
+    let didScan = false;
+
+    if (priceRect) {
+        didScan = true;
+        await scanRegion('price', priceRect);
+    }
+
+    if (atrRect) {
+        didScan = true;
+        await scanRegion('atr', atrRect);
+    }
+
+    if (didScan) {
+        setStatus('Scan complete ✓', 'ready');
+    } else {
+        showToast('No zones selected to scan');
+    }
+
+    btnScan.classList.remove('disabled');
+});
+
+/* ── Price display formatting ─────────────────────────────── */
+function updatePriceDisplay() {
+    const val = priceInput.value;
+    const parts = val.split('.');
+    if (parts.length > 1) {
+        priceInt.innerText = parts[0] || '0';
+        priceDec.innerText = '.' + parts.slice(1).join('');
+    } else {
+        priceInt.innerText = val || '0';
+        priceDec.innerText = '.00';
+    }
+}
+priceInput.addEventListener('input', updatePriceDisplay);
+
+// Copy price
+document.getElementById('priceCopyBtn').addEventListener('click', async () => {
+    const val = priceInput.value;
+    if (!val) { showToast('Nothing to copy'); return; }
+    if (await mobileCopy(val)) showToast('Price copied'); else showToast('Copy unavailable — long-press to copy');
+});
+
+// Mult stepper
+document.getElementById('multUp').addEventListener('click', () => {
+    let v = parseFloat(multInput.value) || 1.0;
+    multInput.value = (v + 0.1).toFixed(1);
+});
+document.getElementById('multDown').addEventListener('click', () => {
+    let v = parseFloat(multInput.value) || 1.0;
+    if (v > 0.1) multInput.value = (v - 0.1).toFixed(1);
+});
+
+/* ── Buy / Sell + calculation (original logic, unchanged) ─── */
+const resultPerc   = document.getElementById('resultPerc');
+const resultTarget = document.getElementById('resultTarget');
+const btnBuy  = document.getElementById('btnBuy');
+const btnSell = document.getElementById('btnSell');
+const btnSwap = document.getElementById('btnSwap');
+const actionGlow = document.getElementById('actionGlow');
+const pasteResultVal = document.getElementById('pasteResultVal');
+const pastePriceVal  = document.getElementById('pastePriceVal');
+
+let exactTargetPrice = null;
+
+function calculate(direction) {
+    const price = parseFloat((priceInput.value || '').replace(/,/g, ''));
+    const atr = parseFloat((atrInput.value || '').replace(/,/g, ''));
+    const m = parseFloat((multInput.value || '').replace(/,/g, ''));
+
+    if (isNaN(price)) { priceInput.focus(); showToast('Enter a price first'); return; }
+    if (isNaN(atr)) { atrInput.focus(); showToast('Enter an ATR value'); return; }
+    if (isNaN(m) || m <= 0) { multInput.focus(); showToast('Multiplier must be > 0'); return; }
+
+    const effectiveAtr = atr * m;
+
+    let T, M, delta, nabla, finalResult;
+    if (price <= 1) {
+        T = price;
+        M = 1 + (0.15 / (1 + Math.exp(-10 * (T - 1)))) + (4 / Math.pow(125 * T, 0.14));
+        delta = (effectiveAtr / price) * M * 100;
+        finalResult = delta;
+    } else {
+        T = 1 / price;
+        M = 1 + (0.15 / (1 + Math.exp(-10 * (T - 1)))) + (4 / Math.pow(125 * T, 0.14));
+        delta = (effectiveAtr / price) * M * 100;
+        nabla = ((100 / (100 + delta)) - 1) * 100;
+        finalResult = nabla;
+    }
+
+    let N = Math.abs(finalResult);
+    if (direction === 'sell') N = -N;
+
+    const isPositive = N > 0;
+    const sign = isPositive ? '+' : '';
+    resultPerc.innerText = sign + N.toFixed(4) + '%';
+    resultPerc.className = 'expected-perc' + (isPositive ? '' : ' negative');
+
+    exactTargetPrice = price * (1 + N / 100);
+    resultTarget.innerText = exactTargetPrice.toFixed(6);
+
+    pasteResultVal.innerText = price.toFixed(6) + '  ' + sign + N.toFixed(4) + '%  →  ' + exactTargetPrice.toFixed(6);
+    pastePriceVal.innerText = price.toFixed(6);
+
+    showToast((direction === 'buy' ? 'Buy' : 'Sell') + ' move calculated');
+}
+
+btnBuy.addEventListener('click', () => {
+    btnBuy.classList.add('active'); btnBuy.classList.remove('dimmed');
+    btnSell.classList.remove('active'); btnSell.classList.add('dimmed');
+    actionGlow.className = 'action-glow buy-glow';
+    calculate('buy');
+});
+btnSell.addEventListener('click', () => {
+    btnSell.classList.add('active'); btnSell.classList.remove('dimmed');
+    btnBuy.classList.remove('active'); btnBuy.classList.add('dimmed');
+    actionGlow.className = 'action-glow sell-glow';
+    calculate('sell');
+});
+btnSwap.addEventListener('click', () => {
+    if (btnBuy.classList.contains('active')) btnSell.click();
+    else btnBuy.click();
+});
+
+// Copy target result
+document.getElementById('resultCopyBtn').addEventListener('click', async () => {
+    if (exactTargetPrice === null) { showToast('Nothing to copy yet'); return; }
+    if (await mobileCopy(exactTargetPrice.toFixed(6))) showToast('Target price copied'); else showToast('Copy unavailable — long-press to copy');
+});
+resultTarget.addEventListener('click', () => document.getElementById('resultCopyBtn').click());
+
+// Paste-in fields
+document.getElementById('pastePriceBtn').addEventListener('click', async () => {
+    try {
+        const text = await mobilePaste();
+        if (!text) { showToast('Clipboard empty'); return; }
+        priceInput.value = text.trim();
+        updatePriceDisplay();
+        pastePriceVal.innerText = text.trim();
+        showToast('Price pasted');
+    } catch(e) { showToast('Clipboard permission denied'); }
+});
+document.getElementById('pasteResultBtn').addEventListener('click', async () => {
+    try {
+        const text = await mobilePaste();
+        if (!text) { showToast('Clipboard empty'); return; }
+        pasteResultVal.innerText = text.trim();
+        showToast('Result pasted');
+    } catch(e) { showToast('Clipboard permission denied'); }
+});
+
+/* keep view sane on rotation / resize */
+window.addEventListener('resize', () => { if (imageLoaded) { clampView(); applyView(); } initSheet(); });
+
+/* ── Draggable Bottom Sheet ───────────────────────────────── */
+(function initSheet() {
+    const sheet     = document.getElementById('sheet');
+    const handle    = document.getElementById('sheetHandle');
+    const inner     = document.getElementById('sheetInner');
+    const app       = document.getElementById('app');
+    const PEEK      = 28;   // px visible when fully collapsed (just handle)
+    const VH        = window.innerHeight;
+
+    // Three snap positions (from bottom): collapsed=PEEK, mid=55%, full=100%
+    const SNAPS = [
+        PEEK,
+        Math.round(VH * 0.55),
+        VH
+    ];
+    // Index 0=collapsed, 1=mid (default), 2=full
+    let snapIdx = 1;
+
+    // Set sheet height once: always full height, position via translateY
+    sheet.style.height = VH + 'px';
+
+    function translateForHeight(h) {
+        return VH - h;
+    }
+
+    function applySnap(idx, animate) {
+        snapIdx = Math.max(0, Math.min(2, idx));
+        const h = SNAPS[snapIdx];
+        const ty = translateForHeight(h);
+        if (!animate) sheet.classList.add('dragging');
+        sheet.style.transform = `translateY(${ty}px)`;
+        if (!animate) {
+            void sheet.offsetHeight;
+        }
+        if (!animate) sheet.classList.remove('dragging');
+
+        // Lock inner scroll only when at full height
+        inner.style.overflowY = (snapIdx === 2) ? 'auto' : 'hidden';
+
+        // Update app padding so canvas fills correctly
+        document.documentElement.style.setProperty('--sheet-mid-h', (snapIdx === 2 ? 0 : h) + 'px');
+
+        // Show/hide topbar+dock
+        if (snapIdx === 2) {
+            app.classList.add('sheet-full');
+        } else {
+            app.classList.remove('sheet-full');
+        }
+    }
+
+    // Init at mid snap without animation
+    sheet.classList.add('dragging');
+    applySnap(1, false);
+    requestAnimationFrame(() => sheet.classList.remove('dragging'));
+
+    // ── Touch / pointer drag on the handle ──
+    let dragActive = false;
+    let startY = 0;
+    let startTY = 0;
+    let lastY = 0;
+    let lastTime = 0;
+    let velocity = 0;
+
+    function currentTranslateY() {
+        const m = new DOMMatrix(getComputedStyle(sheet).transform);
+        return m.m42;
+    }
+
+    handle.addEventListener('pointerdown', (e) => {
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        handle.setPointerCapture(e.pointerId);
+        dragActive = true;
+        startY = e.clientY;
+        startTY = currentTranslateY();
+        lastY = e.clientY;
+        lastTime = performance.now();
+        velocity = 0;
+        sheet.classList.add('dragging');
+        e.preventDefault();
+    });
+
+    handle.addEventListener('pointermove', (e) => {
+        if (!dragActive) return;
+        const now = performance.now();
+        const dy = e.clientY - lastY;
+        const dt = now - lastTime;
+        if (dt > 0) velocity = dy / dt; // px/ms
+
+        const newTY = Math.max(0, Math.min(VH - PEEK, startTY + (e.clientY - startY)));
+        sheet.style.transform = `translateY(${newTY}px)`;
+        lastY = e.clientY;
+        lastTime = now;
+    });
+
+    handle.addEventListener('pointerup', (e) => {
+        if (!dragActive) return;
+        dragActive = false;
+        sheet.classList.remove('dragging');
+        handle.releasePointerCapture(e.pointerId);
+
+        const currentTY = currentTranslateY();
+        const currentH  = VH - currentTY;
+
+        // Convert velocity (px/ms → positive = moving down = closing)
+        // Snap to nearest if slow, else follow velocity direction
+        const VELOCITY_THRESH = 0.4; // px/ms
+        let targetIdx;
+
+        if (velocity > VELOCITY_THRESH) {
+            // Flicking down — snap to next lower snap
+            targetIdx = snapIdx - 1;
+        } else if (velocity < -VELOCITY_THRESH) {
+            // Flicking up — snap to next higher snap
+            targetIdx = snapIdx + 1;
+        } else {
+            // Find nearest snap by height
+            let minDist = Infinity;
+            targetIdx = snapIdx;
+            SNAPS.forEach((h, i) => {
+                const dist = Math.abs(currentH - h);
+                if (dist < minDist) { minDist = dist; targetIdx = i; }
+            });
+        }
+
+        applySnap(targetIdx, true);
+    });
+
+    handle.addEventListener('pointercancel', () => {
+        dragActive = false;
+        sheet.classList.remove('dragging');
+        applySnap(snapIdx, true);
+    });
+
+    // Re-init on resize
+    window._sheetInit = initSheet;
+})();
+
+</script>
+
+</body>
+</html>
