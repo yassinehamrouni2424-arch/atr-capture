@@ -12,7 +12,6 @@
 <meta name="apple-mobile-web-app-title" content="ATR Capture">
 <meta name="theme-color" content="#050505">
 
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html, body {
@@ -1349,19 +1348,25 @@ async function mobilePaste() {
     return null;
 }
 
-/* ── OCR engine — robust multi-pass TradingView scanner ────── */
-let ocrWorker = null;
+/* ── OCR engine — native Android text recognition ─────────── */
+const nativeOcrRequests = new Map();
+let nativeOcrNextId = 0;
 
-async function getOcrWorker() {
-    if (ocrWorker) return ocrWorker;
-    setStatus('Loading scanner…', 'busy');
-    ocrWorker = await Tesseract.createWorker('eng');
-    await ocrWorker.setParameters({
-        tessedit_char_whitelist: '0123456789.,-',
-        preserve_interword_spaces: '0',
-        user_defined_dpi: '300'
+window.__nativeOcrResult = (requestId, text, error) => {
+    const request = nativeOcrRequests.get(requestId);
+    if (!request) return;
+    nativeOcrRequests.delete(requestId);
+    if (error) request.reject(new Error(error));
+    else request.resolve(text || '');
+};
+
+function runNativeOcr(canvas) {
+    if (!window.NativeOcr) return Promise.reject(new Error('Native scanner unavailable'));
+    const requestId = String(++nativeOcrNextId);
+    return new Promise((resolve, reject) => {
+        nativeOcrRequests.set(requestId, {resolve, reject});
+        NativeOcr.recognize(requestId, canvas.toDataURL('image/png'));
     });
-    return ocrWorker;
 }
 
 function normalizeOcrText(text) {
@@ -1465,22 +1470,12 @@ function makeOcrCanvas(rect, mode) {
     return canvas;
 }
 
-async function runOcrPass(canvas, psm) {
-    const worker = await getOcrWorker();
-
-    await worker.setParameters({
-        tessedit_char_whitelist: '0123456789.,-',
-        tessedit_pageseg_mode: String(psm),
-        preserve_interword_spaces: '0',
-        user_defined_dpi: '300'
-    });
-
-    const result = await worker.recognize(canvas);
-
+async function runOcrPass(canvas) {
+    const text = await runNativeOcr(canvas);
     return {
-        rawText: result.data.text || '',
-        confidence: Number(result.data.confidence) || 0,
-        parsed: parseOcrNumber(result.data.text || '')
+        rawText: text,
+        confidence: 100,
+        parsed: parseOcrNumber(text)
     };
 }
 
@@ -1489,17 +1484,17 @@ async function scanRegion(tool, rect) {
 
     try {
         const results = [];
-        const passes = tool === 'price'
-            ? [{mode: 'bright', psm: 7}, {mode: 'adaptive', psm: 8}, {mode: 'original', psm: 13}]
-            : [{mode: 'red', psm: 7}, {mode: 'redSoft', psm: 8}, {mode: 'original', psm: 13}];
+        // One native read is faster and substantially more accurate for this
+        // phone-chart font than repeating the same web OCR model.
+        const passes = [{mode: 'original'}];
 
-        for (const {mode, psm} of passes) {
+        for (const {mode} of passes) {
             const canvas = makeOcrCanvas(rect, mode);
             try {
-                const result = await runOcrPass(canvas, psm);
-                if (result.parsed) results.push({...result, mode, psm});
+                const result = await runOcrPass(canvas);
+                if (result.parsed) results.push({...result, mode});
             } catch (e) {
-                console.warn('OCR pass failed:', mode, psm, e);
+                console.warn('OCR pass failed:', mode, e);
             }
         }
 
