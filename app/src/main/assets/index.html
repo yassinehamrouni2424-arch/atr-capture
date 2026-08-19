@@ -849,6 +849,13 @@ let imageLoaded = false;
 let natW = 0, natH = 0;          // natural image size
 const view = { scale: 1, tx: 0, ty: 0 };
 
+// Tight normalized zones for the two values in the supplied chart layout.
+// Manual rectangle selection can still override these if the layout changes.
+const knownTargets = {
+    price: { x: 0.733, y: 0.288, w: 0.263, h: 0.052 },
+    atr:   { x: 0.010, y: 0.858, w: 0.230, h: 0.050 }
+};
+
 function applyView() {
     imgLayer.style.transform = `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})`;
 }
@@ -906,11 +913,12 @@ fileInput.addEventListener('change', (e) => {
         imageLoaded = true;
         fitView();
         clearSelections();
+        placeKnownTargetZones();
         ['btnZoom','btnSelectPrice','btnSelectAtr'].forEach(id =>
             document.getElementById(id).classList.remove('disabled'));
-        setStatus('Image ready', 'ready');
-        statusStrip.innerHTML = 'Pinch / drag to navigate — arm <b>Price</b> or <b>ATR</b> to scan a zone';
-        showToast('Screenshot loaded');
+        setStatus('Targets ready. Click SCAN', 'ready');
+        statusStrip.innerHTML = 'Price and ATR targets are set automatically for this chart layout.';
+        showToast('Screenshot loaded — targets ready');
         URL.revokeObjectURL(url);
     };
     probe.onerror = () => showToast('Could not load that image');
@@ -1246,6 +1254,22 @@ function clearSelections() {
     btnScan.classList.add('disabled');
 }
 
+function placeKnownTargetZones() {
+    const toRect = (target) => ({
+        x: Math.round(natW * target.x),
+        y: Math.round(natH * target.y),
+        w: Math.round(natW * target.w),
+        h: Math.round(natH * target.h)
+    });
+    priceRect = toRect(knownTargets.price);
+    atrRect = toRect(knownTargets.atr);
+    placeSelBox('price', priceRect);
+    placeSelBox('atr', atrRect);
+    updateCropPreview('price', priceRect);
+    updateCropPreview('atr', atrRect);
+    btnScan.classList.remove('disabled');
+}
+
 /* ── Mouse wheel zoom (desktop) ───────────────────────────── */
 canvasWrap.addEventListener('wheel', (e) => {
     if (!imageLoaded || armedTool) return;
@@ -1421,14 +1445,18 @@ function makeOcrCanvas(rect, mode) {
 
     for (let i = 0; i < d.length; i += 4) {
         const gray = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
-        let v = gray;
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        let foreground = false;
 
-        if (mode === 'adaptive') v = gray > mean ? 255 : 0;
-        if (mode === 'high') v = gray > 150 ? 255 : 0;
-        if (mode === 'mid') v = gray > 125 ? 255 : 0;
-        if (mode === 'low') v = gray > 100 ? 255 : 0;
-        if (mode === 'contrast') v = Math.max(0, Math.min(255, (gray - 128)*2 + 128));
+        // Price digits are nearly white. ATR digits are red. Keeping only the
+        // matching ink removes chart lines and prevents 5/9 lookalikes.
+        if (mode === 'bright') foreground = gray > 180;
+        if (mode === 'red') foreground = r > 105 && r > g * 1.30 && r > b * 1.20;
+        if (mode === 'redSoft') foreground = r > 90 && r > g + 35 && r > b + 20;
+        if (mode === 'adaptive') foreground = gray > mean;
 
+        // Dark numerals on white are the most reliable input for Tesseract.
+        const v = foreground ? 0 : 255;
         d[i] = d[i+1] = d[i+2] = v;
         d[i+3] = 255;
     }
@@ -1461,21 +1489,17 @@ async function scanRegion(tool, rect) {
 
     try {
         const results = [];
-        // Three focused attempts keep mobile scanning responsive while still
-        // handling the light/dark chart-label variations users encounter.
-        const modes = ['original', 'adaptive', 'contrast'];
-        const psms = [7];
+        const passes = tool === 'price'
+            ? [{mode: 'bright', psm: 7}, {mode: 'adaptive', psm: 8}, {mode: 'original', psm: 13}]
+            : [{mode: 'red', psm: 7}, {mode: 'redSoft', psm: 8}, {mode: 'original', psm: 13}];
 
-        for (const mode of modes) {
+        for (const {mode, psm} of passes) {
             const canvas = makeOcrCanvas(rect, mode);
-
-            for (const psm of psms) {
-                try {
-                    const result = await runOcrPass(canvas, psm);
-                    if (result.parsed) results.push({...result, mode, psm});
-                } catch (e) {
-                    console.warn('OCR pass failed:', mode, psm, e);
-                }
+            try {
+                const result = await runOcrPass(canvas, psm);
+                if (result.parsed) results.push({...result, mode, psm});
+            } catch (e) {
+                console.warn('OCR pass failed:', mode, psm, e);
             }
         }
 
