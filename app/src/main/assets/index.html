@@ -1461,8 +1461,10 @@ async function scanRegion(tool, rect) {
 
     try {
         const results = [];
-        const modes = ['original', 'adaptive', 'high', 'mid', 'low', 'contrast'];
-        const psms = [7, 8, 13];
+        // Three focused attempts keep mobile scanning responsive while still
+        // handling the light/dark chart-label variations users encounter.
+        const modes = ['original', 'adaptive', 'contrast'];
+        const psms = [7];
 
         for (const mode of modes) {
             const canvas = makeOcrCanvas(rect, mode);
